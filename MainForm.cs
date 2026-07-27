@@ -919,7 +919,7 @@ public sealed class MainForm : Form
 
         _tray.Icon = recording && !paused ? AppIcons.Recording : AppIcons.Idle;
         _tray.Text = recording
-            ? $"Recording — {_recorder.Elapsed:hh\\:mm\\:ss}"
+            ? $"Recording {_recorder.Elapsed:hh\\:mm\\:ss}"
             : "Windows Audio Recorder";
     }
 
@@ -1210,7 +1210,7 @@ public sealed class MainForm : Form
 
         ShowFormatInfo();
 
-        // Only advertise the hotkeys if nothing more important happened during start-up —
+        // Only advertise the hotkeys if nothing more important happened during start-up:
         // a device error reported here must not be overwritten.
         if (_statusLabel.Text == "Ready.")
         {

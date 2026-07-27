@@ -23,7 +23,7 @@ env:
 
 jobs:
   verify-tag-on-main:
-    # A `v*` tag is just a ref — git doesn't tie it to any branch, so pushing one from a
+    # A `v*` tag is just a ref, and git doesn't tie it to any branch, so pushing one from a
     # feature branch would trigger this workflow just the same. Releases are always cut
     # from main (see RELEASING.md), so refuse to build/publish anything if the tagged
     # commit isn't actually reachable from main: catches a tag cut from the wrong branch
@@ -39,7 +39,7 @@ jobs:
         run: |
           git fetch origin main --quiet
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not reachable from main. Releases must be tagged from main — see RELEASING.md."
+            echo "::error::Tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not reachable from main. Releases must be tagged from main, see RELEASING.md."
             exit 1
           fi
 

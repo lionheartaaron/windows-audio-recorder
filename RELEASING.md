@@ -31,7 +31,7 @@ fix/y ──────┘                                  ▲
    ```bash
    git checkout main
    git pull origin main
-   git merge --ff-only develop   # fails loudly if main has diverged — see below if it does
+   git merge --ff-only develop   # fails loudly if main has diverged; see below if it does
    git push origin main
    ```
 
@@ -66,7 +66,7 @@ fix/y ──────┘                                  ▲
 
 ### Why the tag has to be on `main`
 
-Git tags aren't tied to a branch — pushing `v1.0.0` from `develop` or a stray feature branch
+Git tags aren't tied to a branch. Pushing `v1.0.0` from `develop` or a stray feature branch
 would trigger `release.yml` just as well as tagging `main`. Rather than rely on everyone
 remembering the convention, `release.yml` has a `verify-tag-on-main` job that runs first and
 checks the tagged commit is actually an ancestor of `origin/main`; the `windows` and `release`
@@ -90,9 +90,9 @@ git merge main
 git push origin develop
 ```
 
-Same shape as a normal release (merge into `main`, tag, back-merge into `develop`) — the only
-difference is the fix branches from `main` instead of `develop`, so it ships without pulling in
-whatever else is mid-flight on `develop`.
+Same shape as a normal release (merge into `main`, tag, back-merge into `develop`). The only
+difference is that the fix branches from `main` instead of `develop`, so it ships without
+pulling in whatever else is mid-flight on `develop`.
 
 ## Versioning
 
@@ -125,7 +125,7 @@ it isn't already present.
 ## Signing
 
 Neither the MSI nor the .exe is code-signed. SmartScreen will show a "Windows protected your
-PC" prompt on first run until the download builds reputation — users click *More info* > *Run
+PC" prompt on first run until the download builds reputation. Users click *More info* > *Run
 anyway*. Signing needs a paid certificate; if one is obtained, add a `signtool` step to the
 `windows` job in `release.yml` after the publish and before the MSI build, and sign the MSI
 after `wix build`.
@@ -137,5 +137,5 @@ after `wix build`.
 | Ship what's on `develop` | Merge `develop` → `main`, bump version, tag `main`, push tag |
 | Ship an urgent fix now | Branch `hotfix/*` from `main`, merge to `main`, tag, back-merge to `develop` |
 | Build an installer without releasing | `pwsh Packaging/windows/build-local.ps1 -Version X.Y.Z` |
-| Run a build without releasing | Just push — [`ci.yml`](.github/workflows/ci.yml) runs on every push/PR, any branch |
+| Run a build without releasing | Just push. [`ci.yml`](.github/workflows/ci.yml) runs on every push/PR, any branch |
 | Re-run a release | Delete the tag locally and remotely, fix the problem, re-tag, re-push |

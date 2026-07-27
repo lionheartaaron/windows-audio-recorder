@@ -18,7 +18,7 @@
                                     formats it itself at runtime, so no CustomAction is
                                     needed to do so.
 
-  UpgradeCode below must NEVER change across releases — it's how Windows Installer
+  UpgradeCode below must NEVER change across releases: it's how Windows Installer
   recognizes future versions as upgrades of this same product instead of a separate install.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"

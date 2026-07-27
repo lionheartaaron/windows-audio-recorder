@@ -181,13 +181,13 @@ public sealed class LoopbackRecorder : IDisposable
                 if (outChannels > 2)
                 {
                     outChannels = 2;
-                    Notice = "MP3 is stereo at most — downmixed to stereo.";
+                    Notice = "MP3 is stereo at most; downmixed to stereo.";
                 }
 
                 int mp3Rate = AppSettings.NearestMp3Rate(outRate);
                 if (mp3Rate != outRate)
                 {
-                    Notice = $"MP3 cannot encode {outRate:n0} Hz — recording at {mp3Rate:n0} Hz.";
+                    Notice = $"MP3 cannot encode {outRate:n0} Hz; recording at {mp3Rate:n0} Hz.";
                     outRate = mp3Rate;
                 }
             }

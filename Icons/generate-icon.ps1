@@ -1,9 +1,9 @@
-# Regenerates Icons/app.ico — the .exe's file icon (ApplicationIcon in the .csproj) and the
+# Regenerates Icons/app.ico, the .exe's file icon (ApplicationIcon in the .csproj) and the
 # MSI's ARPPRODUCTICON / Start Menu shortcut icon.
 #
 # The mark is the same record dot AppIcons.cs draws at runtime for the window and tray, just
 # scaled: a ring inset 12.5% of the canvas, stroked at ~11%, around a filled 25% centre dot.
-# Keeping one definition in two places is deliberate — the app must not depend on an icon file
+# Keeping one definition in two places is deliberate: the app must not depend on an icon file
 # existing at runtime, and the installer cannot call into the app to draw one.
 #
 # Usage: pwsh Icons/generate-icon.ps1
@@ -110,7 +110,7 @@ try {
 
     $offset = 6 + (16 * $entries.Count)
     foreach ($e in $entries) {
-        # 0 in the width/height byte means 256 — the field is a single byte.
+        # 0 in the width/height byte means 256; the field is a single byte.
         $dim = if ($e.Size -ge 256) { 0 } else { $e.Size }
         $bw.Write([byte]$dim); $bw.Write([byte]$dim)
         $bw.Write([byte]0); $bw.Write([byte]0)

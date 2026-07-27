@@ -10,7 +10,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
 
     <AssemblyTitle>Windows Audio Recorder</AssemblyTitle>
-    <Description>Records whatever your PC is playing, straight from the output device via WASAPI loopback — no virtual audio cable, no Stereo Mix, no rerouting.</Description>
+    <Description>Records whatever your PC is playing, straight from the output device via WASAPI loopback. No virtual audio cable, no Stereo Mix, no rerouting.</Description>
     <Product>Windows Audio Recorder</Product>
     <Authors>Aaron Lionheart</Authors>
     <Company>Lionheart Global Corporation Pty Ltd</Company>
@@ -26,7 +26,7 @@
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <!-- The .exe's file icon (Explorer, taskbar, Alt-Tab) and the MSI's product icon. The
-         window and tray icons are drawn at runtime instead — see AppIcons.cs — so the app
+         window and tray icons are drawn at runtime instead (see AppIcons.cs), so the app
          never depends on this file existing. Regenerate with Icons/generate-icon.ps1. -->
     <ApplicationIcon>Icons\app.ico</ApplicationIcon>
   </PropertyGroup>
