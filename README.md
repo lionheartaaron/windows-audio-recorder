@@ -39,6 +39,8 @@ This app is a thin wrapper around that API. Pick an output device, press Record.
 - **Timed splitting and auto-stop.** Roll to a new file every N minutes, or stop after N.
 - **Silence is recorded as silence.** WASAPI stops delivering packets entirely when the
   audio engine idles; the recorder pads the gap so file length always matches the clock.
+- **Buffered in RAM, never dropped.** Captured audio is queued in memory and written out by a
+  separate thread, so a slow or busy disk costs memory rather than samples.
 - **Follows the default device.** Change your output in Windows and capture follows it.
 - **Tray mode**, recent-recordings list, live size estimate and free-disk readout.
 - Settings persist between runs. Nothing is sent anywhere; there is no telemetry.
@@ -158,8 +160,19 @@ A few things the implementation is deliberate about:
 - **The recorder owns its own `MMDevice`.** NAudio hands a capture the device's cached
   `AudioClient`, so a device object disposed elsewhere (a UI list being rebuilt, say) would
   tear down a running capture with it.
-- **Buffer overruns drop audio instead of throwing.** A stalled disk costs you samples, not
-  the take.
+- **Audio reaches RAM before it reaches disk.** The capture callback does one copy into a pooled
+  50 ms block and returns. A dedicated writer thread does the mixing, resampling, conversion,
+  encoding and file I/O. This is the difference between a stall costing latency and a stall
+  costing samples: NAudio raises `DataAvailable` synchronously and does not release the endpoint
+  buffer until the handler returns, so writing to disk in there means a slow write stops the
+  endpoint being drained and Windows discards packets before the app ever sees them — with no
+  exception and no flag to notice it by.
+- **Nothing is dropped silently.** Blocks come from a pool the writer refills as it drains, so
+  the steady state circulates a handful of them and allocates nothing; falling behind grows the
+  pool instead of discarding audio, and catching up releases the surplus. Memory tracks the
+  backlog that actually happened — a few hundred KB in practice. There is a ten-minute backstop
+  so a permanently dead disk cannot grow the process until it dies and takes the whole take with
+  it, and reaching it stops the recording with an error rather than quietly punching a hole in it.
 - **Layout is measured, not hard-coded.** Everything sizes from preferred size and the form
   is `PerMonitorV2`-aware, so nothing clips at 125%, 150% or 200% scaling.
 
@@ -168,6 +181,7 @@ A few things the implementation is deliberate about:
 | File | Role |
 | --- | --- |
 | [`LoopbackRecorder.cs`](LoopbackRecorder.cs) | Capture, processing chain, file writing, splitting, metering |
+| [`CaptureQueue.cs`](CaptureQueue.cs) | Pooled buffer queue between the capture thread and the writer thread |
 | [`MainForm.cs`](MainForm.cs) | The entire UI, built in code (no designer file) |
 | [`AppSettings.cs`](AppSettings.cs) | Persisted preferences and format constants |
 | [`ChannelMixSampleProvider.cs`](ChannelMixSampleProvider.cs) | Down/up-mixing between channel counts |

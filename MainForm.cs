@@ -839,8 +839,20 @@ public sealed class MainForm : Form
         {
             if (_recorder.IsRecording)
             {
-                _recorder.StopRecording();
+                // Stopping flushes whatever the RAM buffer is still holding, which is normally
+                // instant but can take a moment on a slow disk; awaiting keeps the window alive.
+                SetStatus("Finishing the file...");
+                await _recorder.StopRecordingAsync();
+
+                double behind = _recorder.PeakBufferedSeconds;
                 if (!_settings.MonitorWhenIdle) await _recorder.StopCaptureAsync();
+
+                // OnSegmentCompleted has already reported the save; only override it when the disk
+                // struggled, because that is worth knowing before the next long take.
+                if (behind >= 1)
+                {
+                    SetStatus($"Saved · the disk fell up to {behind:0.0}s behind; RAM covered it.");
+                }
             }
             else
             {
@@ -933,7 +945,18 @@ public sealed class MainForm : Form
         if (_recorder.IsRecording)
         {
             _timerLabel.Text = _recorder.Elapsed.ToString(@"hh\:mm\:ss");
-            _fileLabel.Text = $"{Path.GetFileName(_recorder.CurrentPath)}  ·  {FormatSize(_recorder.EstimatedFileBytes)}";
+
+            string label = $"{Path.GetFileName(_recorder.CurrentPath)}  ·  {FormatSize(_recorder.EstimatedFileBytes)}";
+
+            // Normally zero. Anything sustained here means the disk is behind and RAM is covering
+            // for it, which is worth seeing even though nothing is being lost.
+            double buffered = _recorder.BufferedSeconds;
+            if (buffered >= 0.5)
+            {
+                label += $"  ·  buffering {buffered:0.0}s in {FormatSize(_recorder.BufferedPoolBytes)}";
+            }
+
+            _fileLabel.Text = label;
             if (++_diskTicks % 60 == 0) UpdateEstimates();
         }
     }
@@ -1224,8 +1247,10 @@ public sealed class MainForm : Form
     {
         if (_recorder.IsRecording)
         {
-            // Finalise the file before the window goes away.
-            _recorder.StopRecording();
+            // Finalise the file before the window goes away, flushing whatever RAM still holds.
+            // This blocks, so the writer's own SegmentCompleted cannot reach the recent list in
+            // time to be saved below; add the path here instead. AddRecent de-duplicates.
+            if (_recorder.StopRecording() is { } path) AddRecent(path);
         }
 
         _settings.Recent = [.. _recentList.Items.Cast<ListViewItem>().Select(i => (string)i.Tag!)];

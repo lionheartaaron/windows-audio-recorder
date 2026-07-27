@@ -26,56 +26,98 @@ public sealed record RecordingRequest(
 /// before you ever press record (and so recording starts instantly), while recording just adds a
 /// processing chain and a file on top of the running capture.
 /// </para>
+/// <para>
+/// Audio reaches RAM before it reaches disk. The capture callback copies each packet into a
+/// <see cref="CaptureQueue"/> and returns; a dedicated writer thread does the mixing, resampling,
+/// conversion, encoding and file I/O. Nothing slow runs on the capture thread, and a disk that
+/// stalls costs memory rather than samples.
+/// </para>
 /// </summary>
 public sealed class LoopbackRecorder : IDisposable
 {
-    private const int PadThresholdMs = 300;   // comfortably above the pipeline's own latency
+    /// <summary>
+    /// Allocation unit for buffered audio, and the most the writer takes on in one go. Blocks are
+    /// consecutive slices of one byte stream rather than one per packet, so this sets the
+    /// granularity of pooling and of the writer's steps, not the latency: the writer seals the
+    /// part-filled block before each drain, so the newest packet never waits for a block to fill.
+    /// </summary>
+    private const int BlockMs = 50;
+
+    /// <summary>
+    /// A backstop on buffered audio, not a working limit — roughly 230 MB at a typical 48 kHz
+    /// stereo float endpoint. In practice the writer keeps up and a handful of blocks circulate; a
+    /// disk this far behind is not coming back, and stopping here keeps the file that exists rather
+    /// than growing until the process dies and takes the whole take with it.
+    /// </summary>
+    private const int MemoryCeilingSeconds = 600;
+
+    private const int WriterTickMs = 250;      // silence-padding and limit-checking cadence
+    private const int PadThresholdMs = 300;    // comfortably above the pipeline's own latency
+    private const int FinaliseTimeoutMs = 30_000;
     private const float ClipThreshold = 0.999f;
 
     private readonly object _sync = new();
     private readonly object _meterLock = new();
     private readonly Stopwatch _totalClock = new();
     private readonly Stopwatch _segmentClock = new();
-    private readonly List<string> _pendingCompleted = [];
+
+    /// <summary>Raised whenever the writer has work, or state it needs to notice, waiting.</summary>
+    private readonly ManualResetEventSlim _writerSignal = new(false);
 
     private readonly MMDeviceEnumerator _deviceEnumerator = new();
 
     private WasapiLoopbackCapture? _capture;
     private MMDevice? _device;
     private TaskCompletionSource<Exception?>? _captureStopSignal;
-    private System.Threading.Timer? _ticker;
 
+    // Handed to the writer thread by StartRecording, before it starts.
+    private CaptureQueue? _queue;
+    private Thread? _writerThread;
+    private TaskCompletionSource<string?>? _writerDone;
+    private RecordingRequest? _request;
+    private int _sourceBytesPerSecond;
+
+    // Writer-thread only once recording begins. No lock guards these because nothing else touches
+    // them: the file is owned start to finish by one thread, so a stalled write blocks nobody.
     private BufferedWaveProvider? _buffered;
     private ISampleProvider? _chain;
-    private VolumeSampleProvider? _volume;
-    private Stream? _writer;
-    private RecordingRequest? _request;
-    private int _gainDb;
-
+    private Stream? _output;
     private float[] _sampleBuffer = [];
     private byte[] _byteBuffer = [];
     private byte[] _silence = [];
-
     private bool _floatOutput;
     private int _bytesPerSample;
-    private int _outBytesPerSecond;
     private int _outBlockAlign;
     private int _segmentIndex;
+
+    // Read by the UI for display while the writer updates them.
     private long _segmentBytes;
-    private long _totalBytes;
-    private bool _pendingAutoStop;
+    private string? _currentPath;
+
+    private VolumeSampleProvider? _volume;
+    private int _outBytesPerSecond;
 
     private volatile bool _recording;
     private volatile bool _paused;
+    private volatile bool _accepting;        // the capture thread may add to the queue
+    private volatile bool _stopRequested;
+    private volatile bool _autoStopped;
     private volatile bool _clipped;
 
     private float _peakLeft;
     private float _peakRight;
 
-    /// <summary>Raised for every finalised file, including each piece of a split recording.</summary>
+    /// <summary>
+    /// Raised for every finalised file, including each piece of a split recording.
+    /// <para>
+    /// Raised on the writer thread. Handlers must marshal to the UI without blocking on it —
+    /// <c>BeginInvoke</c>, not <c>Invoke</c> — because a shutdown path may be waiting on this same
+    /// thread to finish the file.
+    /// </para>
+    /// </summary>
     public event EventHandler<string>? SegmentCompleted;
 
-    /// <summary>Raised when capture ends without being asked to (endpoint unplugged, format change).</summary>
+    /// <summary>Raised when capture or writing ends without being asked to.</summary>
     public event EventHandler<Exception?>? Aborted;
 
     /// <summary>Raised when recording ends because it hit the configured duration limit.</summary>
@@ -89,17 +131,35 @@ public sealed class LoopbackRecorder : IDisposable
     public string? DeviceName { get; private set; }
     public WaveFormat? SourceFormat { get; private set; }
     public WaveFormat? FileFormat { get; private set; }
-    public string? CurrentPath { get; private set; }
+
+    public string? CurrentPath => Volatile.Read(ref _currentPath);
 
     /// <summary>Set when the requested settings had to be adjusted (an MP3 rate limit, say).</summary>
     public string? Notice { get; private set; }
 
-    public TimeSpan Elapsed => _totalClock.Elapsed;
+    public TimeSpan Elapsed { get { lock (_sync) { return _totalClock.Elapsed; } } }
     public int OutputBytesPerSecond => _outBytesPerSecond;
 
-    public long EstimatedFileBytes => _request?.Format == OutputFormat.Mp3
-        ? (long)(_segmentClock.Elapsed.TotalSeconds * _request.Mp3Bitrate * 125)
-        : 44 + _segmentBytes;
+    /// <summary>Seconds of captured audio sitting in RAM waiting to be written. Normally near zero.</summary>
+    public double BufferedSeconds => ToSeconds(_queue?.Pending ?? 0);
+
+    /// <summary>Deepest the RAM backlog got during the current or most recent take.</summary>
+    public double PeakBufferedSeconds => ToSeconds(_queue?.Peak ?? 0);
+
+    /// <summary>Memory the buffer pool is holding, queued blocks and spares together.</summary>
+    public long BufferedPoolBytes => _queue?.AllocatedBytes ?? 0;
+
+    public long EstimatedFileBytes
+    {
+        get
+        {
+            if (_request?.Format != OutputFormat.Mp3) return 44 + Volatile.Read(ref _segmentBytes);
+            lock (_sync) { return (long)(_segmentClock.Elapsed.TotalSeconds * _request.Mp3Bitrate * 125); }
+        }
+    }
+
+    private double ToSeconds(long bytes) =>
+        _sourceBytesPerSecond > 0 ? (double)bytes / _sourceBytesPerSecond : 0;
 
     // ---- capture -------------------------------------------------------------------------
 
@@ -192,11 +252,29 @@ public sealed class LoopbackRecorder : IDisposable
                 }
             }
 
+            // The queue is where a stalled disk is absorbed, so it is measured in the endpoint's own
+            // format. Whole frames per block: blocks are consecutive slices of one byte stream, and
+            // a boundary that fell mid-frame would misalign every sample after it.
+            _sourceBytesPerSecond = source.AverageBytesPerSecond;
+            int blockSize = Math.Max(source.AverageBytesPerSecond * BlockMs / 1000, source.BlockAlign);
+            blockSize -= blockSize % source.BlockAlign;
+
+            // Reused between takes so the pool keeps its blocks and the first take is not the only
+            // one that has to allocate them.
+            if (_queue is null || _queue.BlockSize != blockSize)
+            {
+                _queue = new CaptureQueue(blockSize, (long)source.AverageBytesPerSecond * MemoryCeilingSeconds);
+            }
+            else
+            {
+                _queue.Reset();
+            }
+
             _buffered = new BufferedWaveProvider(source)
             {
-                ReadFully = false,               // must not manufacture silence; padding is our job
-                DiscardOnBufferOverflow = true,  // a stalled disk drops audio rather than throwing
-                BufferDuration = TimeSpan.FromSeconds(5)
+                ReadFully = false,                // must not manufacture silence; padding is our job
+                DiscardOnBufferOverflow = false,  // the queue is the buffer; this filling is a bug
+                BufferDuration = TimeSpan.FromSeconds(2)
             };
 
             ISampleProvider chain = _buffered.ToSampleProvider();
@@ -204,7 +282,6 @@ public sealed class LoopbackRecorder : IDisposable
             if (outRate != source.SampleRate) chain = new WdlResamplingSampleProvider(chain, outRate);
 
             // Always in the chain, even at 0 dB, so the slider can be moved mid-take.
-            _gainDb = request.GainDb;
             _volume = new VolumeSampleProvider(chain) { Volume = GainToVolume(request.GainDb) };
             _chain = _volume;
 
@@ -224,8 +301,9 @@ public sealed class LoopbackRecorder : IDisposable
 
             _request = request;
             _segmentIndex = 1;
-            _totalBytes = 0;
             _clipped = false;
+            _stopRequested = false;
+            _autoStopped = false;
             ResetPeaks();
 
             Directory.CreateDirectory(request.Folder);
@@ -235,79 +313,88 @@ public sealed class LoopbackRecorder : IDisposable
             _recording = true;
             _totalClock.Restart();
 
-            // Silence must not stall the limits: WASAPI delivers no packets at all while the
-            // audio engine is idle, so anything driven only by DataAvailable would overrun its
-            // split point and keep the file short. This ticks regardless.
-            _ticker = new System.Threading.Timer(OnTick, null, 250, 250);
-        }
-    }
-
-    private void OnTick(object? state)
-    {
-        lock (_sync)
-        {
-            if (_recording && !_paused)
+            _writerDone = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _writerSignal.Reset();
+            _writerThread = new Thread(WriterLoop)
             {
-                try
-                {
-                    PadSilentGap();
-                    EnforceLimits();
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Tick failed: {ex}");
-                }
-            }
-        }
+                Name = "audio-writer",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal
+            };
+            _writerThread.Start();
 
-        DrainNotifications();
+            // Last, so the capture thread cannot reach a half-built pipeline.
+            _accepting = true;
+        }
     }
 
-    /// <summary>Finalises the current file. Returns its path, or null if nothing was recording.</summary>
+    /// <summary>
+    /// Finalises the current file once the writer has flushed everything RAM was holding. Resolves
+    /// to its path, or null if nothing was recording.
+    /// </summary>
+    public Task<string?> StopRecordingAsync()
+    {
+        var done = _writerDone;
+        if (!_recording || done is null) return Task.FromResult<string?>(null);
+
+        _accepting = false;
+        _stopRequested = true;
+        _writerSignal.Set();
+        return done.Task;
+    }
+
+    /// <summary>
+    /// Blocking form of <see cref="StopRecordingAsync"/>, for shutdown paths that have to see the
+    /// file closed before the process goes. Elsewhere prefer the async form, which leaves the UI
+    /// responsive while a backlog drains.
+    /// </summary>
     public string? StopRecording()
     {
-        string? path;
-        lock (_sync)
-        {
-            path = FinishRecording();
-        }
+        var pending = StopRecordingAsync();
+        if (pending.Wait(FinaliseTimeoutMs)) return pending.Result;
 
-        if (path is not null) SegmentCompleted?.Invoke(this, path);
-        return path;
+        // A disk this unresponsive is not about to recover, and hanging on exit is worse than
+        // giving up on the tail. The writer is a background thread, so it goes with the process.
+        Debug.WriteLine("Timed out waiting for the writer to finalise.");
+        return null;
     }
 
     public void Pause()
     {
         lock (_sync)
         {
-            if (!_recording || _paused) return;
+            if (!_recording || _paused || _stopRequested) return;
             _paused = true;
+            _accepting = false;
             _totalClock.Stop();
             _segmentClock.Stop();
         }
+
+        // Whatever is already buffered was captured before the pause, so it is left to drain into
+        // the file rather than discarded.
+        _writerSignal.Set();
     }
 
     public void Resume()
     {
         lock (_sync)
         {
-            if (!_recording || !_paused) return;
-            // Drop whatever queued up while paused so the take resumes cleanly.
-            _buffered?.ClearBuffer();
+            if (!_recording || !_paused || _stopRequested) return;
             _paused = false;
+            _accepting = true;
             _totalClock.Start();
             _segmentClock.Start();
         }
+
+        _writerSignal.Set();
     }
 
     /// <summary>Applies a gain in dB, taking effect immediately even mid-recording.</summary>
     public void SetGain(int decibels)
     {
-        lock (_sync)
-        {
-            _gainDb = decibels;
-            if (_volume is not null) _volume.Volume = GainToVolume(decibels);
-        }
+        // A lone float store: the writer picks it up on its next block, which is what "immediately"
+        // means for audio already on its way to the file.
+        if (_volume is { } volume) volume.Volume = GainToVolume(decibels);
     }
 
     private static float GainToVolume(int decibels) => (float)Math.Pow(10, decibels / 20.0);
@@ -338,88 +425,38 @@ public sealed class LoopbackRecorder : IDisposable
     {
         if (e.BytesRecorded == 0) return;
 
-        if (!_recording || _paused)
+        if (!_accepting)
         {
             MeterSource(e.Buffer, e.BytesRecorded);
             return;
         }
 
-        Exception? failure = null;
-        lock (_sync)
+        // The only work this thread does for a take: one copy into a pooled block.
+        if (!_queue!.Append(e.Buffer.AsSpan(0, e.BytesRecorded)))
         {
-            if (_recording && _buffered is not null && _chain is not null)
-            {
-                try
-                {
-                    _buffered.AddSamples(e.Buffer, 0, e.BytesRecorded);
-                    Pump();
-                }
-                catch (Exception ex)
-                {
-                    failure = ex;
-                    FinishRecording();
-                }
-            }
+            // At the ceiling. Stop feeding a queue that cannot take it and let the writer end the
+            // take with an error, rather than dropping this packet and every one after it in silence.
+            _accepting = false;
         }
 
-        // Events go out after the lock so a handler can call back in without deadlocking.
-        DrainNotifications();
-        if (failure is not null) Aborted?.Invoke(this, failure);
+        _writerSignal.Set();
     }
 
-    private void Pump()
+    private async void OnCaptureStopped(object? sender, StoppedEventArgs e)
     {
-        PadSilentGap();
+        var capture = _capture;
+        _capture = null;
 
-        for (int guard = 0; guard < 64 && _recording; guard++)
+        // Whatever is still in RAM was captured before the endpoint went away, so the writer is
+        // given the chance to finish it instead of the tail of the take being thrown out.
+        await StopRecordingAsync().ConfigureAwait(true);
+
+        if (capture is not null)
         {
-            int read = _chain!.Read(_sampleBuffer, 0, _sampleBuffer.Length);
-            if (read <= 0) break;
-
-            MeterOutput(_sampleBuffer, read);
-            int bytes = ConvertSamples(_sampleBuffer, read);
-            _writer!.Write(_byteBuffer, 0, bytes);
-            _segmentBytes += bytes;
-            _totalBytes += bytes;
-
-            EnforceLimits();
-            if (read < _sampleBuffer.Length) break;   // source drained
-        }
-    }
-
-    private void EnforceLimits()
-    {
-        var request = _request;
-        if (request is null || !_recording) return;
-
-        if (request.MaxMinutes > 0 && _totalClock.Elapsed.TotalMinutes >= request.MaxMinutes)
-        {
-            string? path = FinishRecording();
-            if (path is not null) _pendingCompleted.Add(path);
-            _pendingAutoStop = true;
-            return;
-        }
-
-        if (request.SplitMinutes > 0 && _segmentClock.Elapsed.TotalMinutes >= request.SplitMinutes)
-        {
-            RollSegment();
-        }
-    }
-
-    private void OnCaptureStopped(object? sender, StoppedEventArgs e)
-    {
-        string? finalized;
-        lock (_sync)
-        {
-            finalized = FinishRecording();
-        }
-
-        if (_capture is not null)
-        {
-            _capture.DataAvailable -= OnDataAvailable;
-            _capture.RecordingStopped -= OnCaptureStopped;
-            _capture.Dispose();
-            _capture = null;
+            capture.DataAvailable -= OnDataAvailable;
+            capture.RecordingStopped -= OnCaptureStopped;
+            try { capture.Dispose(); }
+            catch (Exception ex) { Debug.WriteLine($"Disposing the capture failed: {ex.Message}"); }
         }
 
         _device?.Dispose();
@@ -427,119 +464,253 @@ public sealed class LoopbackRecorder : IDisposable
         SourceFormat = null;
         CaptureDeviceId = null;
 
-        if (finalized is not null) SegmentCompleted?.Invoke(this, finalized);
-
         var signal = _captureStopSignal;
         _captureStopSignal = null;
         if (signal is not null) signal.TrySetResult(e.Exception);
         else Aborted?.Invoke(this, e.Exception);
     }
 
+    // ---- the writer thread ---------------------------------------------------------------
+
+    /// <summary>
+    /// Owns the output file for the whole take: everything expensive happens here, so a slow disk
+    /// delays this thread alone. Runs until the take is stopped, hits a limit, or fails.
+    /// </summary>
+    private void WriterLoop()
+    {
+        Exception? failure = null;
+
+        try
+        {
+            while (true)
+            {
+                AwaitWork();
+
+                if (_queue!.Exhausted && failure is null)
+                {
+                    // At the memory ceiling. Take the ordinary stop path from here, so everything
+                    // RAM did hold still reaches the file, and report why the take ended.
+                    failure = new IOException(
+                        $"Writing fell more than {MemoryCeilingSeconds / 60} minutes behind the " +
+                        "capture, so recording stopped rather than quietly losing audio. " +
+                        "Everything up to that point is in the file.");
+                    _accepting = false;
+                    _stopRequested = true;
+                }
+
+                DrainQueue();
+
+                if (_stopRequested)
+                {
+                    if (_queue.Pending == 0) break;
+                    continue;                        // flush the backlog before finalising
+                }
+
+                // Silence may only be synthesised, and a segment may only be closed, once the file
+                // has caught up with the queue. Doing either while audio is still buffered would
+                // splice it in ahead of samples that were captured first.
+                if (!_paused && _queue.Pending == 0)
+                {
+                    PadSilentGap();
+                    EnforceLimits();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+            Debug.WriteLine($"Writing failed: {ex}");
+        }
+
+        string? path = Finalise(ref failure);
+        bool autoStopped = _autoStopped;
+
+        _accepting = false;
+        _paused = false;
+        _recording = false;
+
+        if (path is not null) SegmentCompleted?.Invoke(this, path);
+        if (autoStopped) AutoStopped?.Invoke(this, EventArgs.Empty);
+        if (failure is not null) Aborted?.Invoke(this, failure);
+
+        // Last, so a caller resuming from StopRecordingAsync sees the events first.
+        _writerDone!.TrySetResult(path);
+    }
+
+    /// <summary>
+    /// Waits for something to do, or for the padding cadence to come round.
+    /// <para>
+    /// The signal is cleared before the state is tested so no wake-up can be missed: everything
+    /// that raises it mutates the state it reports first, and a sticky signal raised between the
+    /// test and the wait makes the wait return at once.
+    /// </para>
+    /// </summary>
+    private void AwaitWork()
+    {
+        _writerSignal.Reset();
+        if (_queue!.Pending > 0 || _stopRequested || _queue.Exhausted) return;
+        _writerSignal.Wait(WriterTickMs);
+    }
+
+    /// <summary>Moves everything RAM is holding through the pipeline and into the file.</summary>
+    private void DrainQueue()
+    {
+        // Seal first, so the block still being packed is taken too. Without this the newest packet
+        // would wait for a block to fill, and an idle endpoint would leave it waiting indefinitely.
+        _queue!.Seal();
+
+        while (_queue.TryTake(out byte[] block, out int count))
+        {
+            try
+            {
+                _buffered!.AddSamples(block, 0, count);
+                Pump();
+            }
+            finally
+            {
+                _queue.Recycle(block);
+            }
+        }
+    }
+
+    private void Pump()
+    {
+        while (true)
+        {
+            int read = _chain!.Read(_sampleBuffer, 0, _sampleBuffer.Length);
+            if (read <= 0) return;
+
+            MeterOutput(_sampleBuffer, read);
+            int bytes = ConvertSamples(_sampleBuffer, read);
+            _output!.Write(_byteBuffer, 0, bytes);
+            Volatile.Write(ref _segmentBytes, _segmentBytes + bytes);
+
+            if (read < _sampleBuffer.Length) return;   // the buffered source is dry
+        }
+    }
+
+    private void EnforceLimits()
+    {
+        var request = _request;
+        if (request is null) return;
+
+        if (request.MaxMinutes > 0 && Elapsed.TotalMinutes >= request.MaxMinutes)
+        {
+            // Stop taking input and let the loop finalise, the same path a manual stop takes.
+            _accepting = false;
+            _autoStopped = true;
+            _stopRequested = true;
+            return;
+        }
+
+        TimeSpan segment;
+        lock (_sync) { segment = _segmentClock.Elapsed; }
+        if (request.SplitMinutes > 0 && segment.TotalMinutes >= request.SplitMinutes) RollSegment();
+    }
+
     // ---- file plumbing -------------------------------------------------------------------
 
-    /// <summary>Opens the next output file. Caller holds <see cref="_sync"/>.</summary>
+    /// <summary>
+    /// Opens the next output file. NAudio owns the underlying <see cref="FileStream"/>, buffering
+    /// included; there is nothing to gain from a bigger one now that no audio thread waits on it.
+    /// </summary>
     private void OpenSegment()
     {
         var request = _request!;
         string path = BuildPath(request, _segmentIndex);
 
-        _writer = request.Format == OutputFormat.Mp3
+        _output = request.Format == OutputFormat.Mp3
             ? new LameMP3FileWriter(path, FileFormat, request.Mp3Bitrate)
             : new WaveFileWriter(path, FileFormat);
 
-        CurrentPath = path;
-        _segmentBytes = 0;
-        _segmentClock.Restart();
+        Volatile.Write(ref _currentPath, path);
+        Volatile.Write(ref _segmentBytes, 0);
+        lock (_sync) { _segmentClock.Restart(); }
     }
 
-    /// <summary>Closes the current file and starts the next one. Caller holds <see cref="_sync"/>.</summary>
+    /// <summary>Closes the current file and starts the next one. Writer thread only.</summary>
     private void RollSegment()
     {
         PadSilentGap();
-        _writer?.Dispose();
-        _writer = null;
 
-        if (CurrentPath is not null) _pendingCompleted.Add(CurrentPath);
+        string? finished = CurrentPath;
+        _output?.Dispose();
+        _output = null;
 
         _segmentIndex++;
         OpenSegment();
+
+        if (finished is not null) SegmentCompleted?.Invoke(this, finished);
     }
 
-    /// <summary>Finalises the file if one is open. Caller holds <see cref="_sync"/>.</summary>
-    private string? FinishRecording()
+    /// <summary>Closes the file at the end of a take. Writer thread only.</summary>
+    private string? Finalise(ref Exception? failure)
     {
-        if (!_recording) return null;
-
-        _recording = false;
-        _paused = false;
-
-        _ticker?.Dispose();   // safe even when called from the ticker's own callback
-        _ticker = null;
-
         try
         {
-            if (_writer is not null)
+            if (_output is not null)
             {
                 PadSilentGap();
-                _writer.Flush();
+                _output.Flush();
             }
         }
         catch (Exception ex)
         {
+            // Worth surfacing rather than swallowing: a disk that fails on the closing flush has
+            // probably truncated the file, and only the recorder is in a position to say so.
             Debug.WriteLine($"Finalising failed: {ex}");
+            failure ??= ex;
         }
 
-        _writer?.Dispose();
-        _writer = null;
+        string? path = CurrentPath;
+
+        try { _output?.Dispose(); }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Closing the file failed: {ex}");
+            failure ??= ex;
+        }
+
+        _output = null;
         _chain = null;
         _buffered = null;
 
-        _totalClock.Stop();
-        _segmentClock.Stop();
-
-        return CurrentPath;
-    }
-
-    private void DrainNotifications()
-    {
-        string[] completed;
-        bool autoStopped;
-
         lock (_sync)
         {
-            if (_pendingCompleted.Count == 0 && !_pendingAutoStop) return;
-            completed = [.. _pendingCompleted];
-            _pendingCompleted.Clear();
-            autoStopped = _pendingAutoStop;
-            _pendingAutoStop = false;
+            _totalClock.Stop();
+            _segmentClock.Stop();
         }
 
-        foreach (string path in completed) SegmentCompleted?.Invoke(this, path);
-        if (autoStopped) AutoStopped?.Invoke(this, EventArgs.Empty);
+        return path;
     }
 
     /// <summary>
     /// WASAPI stops delivering packets entirely while the audio engine is idle, which would
     /// silently shorten the file. Top it up with real silence so its length keeps matching the
-    /// clock. Caller holds <see cref="_sync"/>.
+    /// clock. Writer thread only, and only ever called with the queue already drained.
     /// </summary>
     private void PadSilentGap()
     {
-        if (_writer is null || _outBytesPerSecond == 0) return;
+        if (_output is null || _outBytesPerSecond == 0) return;
 
-        long expected = (long)(_segmentClock.Elapsed.TotalSeconds * _outBytesPerSecond);
-        long deficit = expected - _segmentBytes;
+        TimeSpan segment;
+        lock (_sync) { segment = _segmentClock.Elapsed; }
+
+        long expected = (long)(segment.TotalSeconds * _outBytesPerSecond);
+        long written = Volatile.Read(ref _segmentBytes);
+        long deficit = expected - written;
         if (deficit < _outBytesPerSecond * PadThresholdMs / 1000) return;
 
         deficit -= deficit % _outBlockAlign;
         while (deficit > 0)
         {
             int chunk = (int)Math.Min(deficit, _silence.Length);
-            _writer.Write(_silence, 0, chunk);
-            _segmentBytes += chunk;
-            _totalBytes += chunk;
+            _output.Write(_silence, 0, chunk);
+            written += chunk;
             deficit -= chunk;
         }
+
+        Volatile.Write(ref _segmentBytes, written);
     }
 
     private string BuildPath(RecordingRequest request, int index)
@@ -661,22 +832,29 @@ public sealed class LoopbackRecorder : IDisposable
 
     public void Dispose()
     {
-        lock (_sync)
+        // Unhook before anything else: NAudio posts RecordingStopped to the thread that built the
+        // capture, and by now nothing is pumping that thread's message queue.
+        var capture = _capture;
+        _capture = null;
+        if (capture is not null)
         {
-            FinishRecording();
+            capture.DataAvailable -= OnDataAvailable;
+            capture.RecordingStopped -= OnCaptureStopped;
         }
 
-        if (_capture is not null)
+        StopRecording();
+
+        if (capture is not null)
         {
-            _capture.DataAvailable -= OnDataAvailable;
-            _capture.RecordingStopped -= OnCaptureStopped;
-            try { _capture.StopRecording(); } catch { /* shutting down */ }
-            _capture.Dispose();
-            _capture = null;
+            try { capture.StopRecording(); } catch { /* shutting down */ }
+            capture.Dispose();
         }
 
         _device?.Dispose();
         _device = null;
         _deviceEnumerator.Dispose();
+
+        // Only safe once the writer has actually gone; it waits on this signal.
+        if (!_recording) _writerSignal.Dispose();
     }
 }
