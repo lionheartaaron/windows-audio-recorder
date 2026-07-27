@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>WindowAudioRecorder</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+
+    <AssemblyTitle>Windows Audio Recorder</AssemblyTitle>
+    <Description>Records whatever your PC is playing, straight from the output device via WASAPI loopback — no virtual audio cable, no Stereo Mix, no rerouting.</Description>
+    <Product>Windows Audio Recorder</Product>
+    <Authors>Aaron Lionheart</Authors>
+    <Company>Lionheart Global Corporation Pty Ltd</Company>
+    <Copyright>Copyright © 2026 Aaron Lionheart</Copyright>
+    <PackageProjectUrl>https://github.com/lionheartaaron/windows-audio-recorder</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <!-- Keep in sync with the tag being released (see RELEASING.md). release.yml also passes
+         -p:Version= at publish time, so a shipped build is correct even if this is missed, but
+         local builds read this one. Three parts here; .NET expands it to 1.0.0.0. -->
+    <Version>1.0.0</Version>
+    <!-- Without this the SDK appends "+<git-commit-sha>" to InformationalVersion, which shows
+         up in the file properties dialog as a meaningless hash next to the version. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
+    <!-- The .exe's file icon (Explorer, taskbar, Alt-Tab) and the MSI's product icon. The
+         window and tray icons are drawn at runtime instead — see AppIcons.cs — so the app
+         never depends on this file existing. Regenerate with Icons/generate-icon.ps1. -->
+    <ApplicationIcon>Icons\app.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.3.0" />
+    <PackageReference Include="NAudio.Lame" Version="2.1.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows MSI for Windows Audio Recorder, built with WiX Toolset v7 (`wix build`).
+
+  Expects these preprocessor variables from the command line (see
+  .github/workflows/release.yml or Packaging/windows/build-local.ps1):
+    ProductVersion  - four-part numeric version, e.g. 1.0.0.0
+    PublishDir      - path to a self-contained `dotnet publish -r win-x64` output folder
+    RepoRoot        - path to the repo root (for the app icon and License.rtf)
+
+  Also requires, at `wix build` time (see the two scripts above):
+    -ext WixToolset.UI.wixext    - the wizard UI (WixUI_InstallDir) and its dialog set
+    -ext WixToolset.Util.wixext  - WixShellExec, for the "Launch Windows Audio Recorder"
+                                    finish checkbox
+    -sw1077                      - silences a known-safe warning about WixShellExecTarget's
+                                    "[INSTALLFOLDER]WindowAudioRecorder.exe" value looking
+                                    like an unresolved property reference; WixShellExec
+                                    formats it itself at runtime, so no CustomAction is
+                                    needed to do so.
+
+  UpgradeCode below must NEVER change across releases — it's how Windows Installer
+  recognizes future versions as upgrades of this same product instead of a separate install.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Windows Audio Recorder"
+           Manufacturer="Lionheart Global Corporation Pty Ltd"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="ad0903d2-eaac-47df-899e-395b2fcab48d"
+           Language="1033"
+           Compressed="yes"
+           Scope="perMachine">
+
+    <SummaryInformation Description="Windows Audio Recorder Installer" Keywords="Installer,Audio,Recorder" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Windows Audio Recorder is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.RepoRoot)\Icons\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/lionheartaaron/windows-audio-recorder" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/lionheartaaron/windows-audio-recorder/issues" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Windows Audio Recorder" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppProgramMenuFolder" Name="Windows Audio Recorder" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Windows Audio Recorder" Level="1">
+      <ComponentGroupRef Id="PublishedFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- Wizard UI: Welcome -> License -> choose folder -> our own "Start Menu shortcut"
+         checkbox page -> Ready to Install (progress) -> Finish (with a "Launch Windows Audio
+         Recorder" checkbox). See the ShortcutOptionsDlg fragment and the Publish overrides
+         below for how the extra page is spliced into the stock WixUI_InstallDir sequence. -->
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.RepoRoot)\Packaging\windows\License.rtf" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <!-- Checked by default; unchecking it on ShortcutOptionsDlg skips the StartMenuShortcut
+         component below via its <Condition>. -->
+    <Property Id="INSTALLSHORTCUT" Value="1" />
+
+    <!-- "Launch Windows Audio Recorder" checkbox on the finish page (WixUI_InstallDir's
+         ExitDialog only shows this control when WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT is set).
+         WixShellExec (from the util extension) drives it off the WixShellExecTarget property
+         rather than a harvested file Id, since PublishedFiles below is auto-harvested and
+         doesn't expose a stable Id for the exe to reference as "[#WindowAudioRecorder.exe]". -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Windows Audio Recorder" />
+    <!-- Pre-checked, matching the usual convention for this checkbox (VS Code, Chrome, ...). -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[INSTALLFOLDER]WindowAudioRecorder.exe" />
+    <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" />
+
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+
+      <!-- Splice ShortcutOptionsDlg between InstallDirDlg and VerifyReadyDlg. A higher Order
+           than the stock rows (which top out at Order="4") means these fire last for the
+           same button click, so they're the transition that actually takes effect; the
+           condition mirrors InstallDirDlg's own stock "path is valid" check so Next doesn't
+           skip past an invalid/unvalidated folder straight to our page. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ShortcutOptionsDlg" Order="10" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ShortcutOptionsDlg" Order="10" Condition="NOT Installed" />
+    </UI>
+  </Package>
+
+  <!-- Custom wizard page: a single "Create a Start Menu shortcut" checkbox, styled to match
+       the stock InstallDirDlg/VerifyReadyDlg pages it sits between. -->
+  <Fragment>
+    <UI>
+      <Dialog Id="ShortcutOptionsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="340" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose whether to create a shortcut for Windows Audio Recorder." />
+
+        <Control Id="StartMenuShortcutCheckBox" Type="CheckBox" X="25" Y="65" Width="300" Height="18" Property="INSTALLSHORTCUT" CheckBoxValue="1" Text="Create a Start Menu shortcut" />
+
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&lt; Back">
+          <Publish Event="NewDialog" Value="InstallDirDlg" Condition="1" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="Next &gt;">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Condition="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+    </UI>
+  </Fragment>
+
+  <!-- One Component per file under the publish output, auto-harvested (no heat.exe needed). -->
+  <Fragment>
+    <ComponentGroup Id="PublishedFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.PublishDir)\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="AppProgramMenuFolder">
+      <!-- Condition skips this component entirely (no shortcut, no registry key) when the
+           user unchecks "Create a Start Menu shortcut" on ShortcutOptionsDlg. -->
+      <Component Id="StartMenuShortcut" Guid="c261891c-c2f2-44f2-8245-d7e87e722314" Condition="INSTALLSHORTCUT = &quot;1&quot;">
+        <Shortcut Id="StartMenuShortcutEntry"
+                  Name="Windows Audio Recorder"
+                  Description="Record whatever your PC is playing"
+                  Target="[INSTALLFOLDER]WindowAudioRecorder.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" />
+        <RemoveFolder Id="RemoveAppProgramMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\WindowsAudioRecorder" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

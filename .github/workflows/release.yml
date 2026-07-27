@@ -1,0 +1,132 @@
+name: Release
+
+# Push a tag like "v1.0.0" to build and publish a Windows installer (MSI) and a portable
+# zip as a GitHub Release. Windows-only by nature, not by choice: the app records through
+# WASAPI loopback and is built on WinForms, neither of which exists off Windows.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never cancel a release build/upload mid-flight
+
+permissions:
+  contents: read # default for every job; only the release job elevates to write
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  verify-tag-on-main:
+    # A `v*` tag is just a ref — git doesn't tie it to any branch, so pushing one from a
+    # feature branch would trigger this workflow just the same. Releases are always cut
+    # from main (see RELEASING.md), so refuse to build/publish anything if the tagged
+    # commit isn't actually reachable from main: catches a tag cut from the wrong branch
+    # before it ships instead of after.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # need full history for the ancestry check below, not just the tag commit
+
+      - name: Confirm tag points at a commit on main
+        run: |
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not reachable from main. Releases must be tagged from main — see RELEASING.md."
+            exit 1
+          fi
+
+  windows:
+    needs: verify-tag-on-main
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Compute version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          # Windows Installer only understands a numeric a.b.c.d, and rejects the SemVer
+          # pre-release suffix a tag like v1.1.0-rc.1 carries. Strip it, then pad or trim to
+          # exactly four parts so both "v1.0.0" and "v1.0.0.0" produce ProductVersion 1.0.0.0.
+          NUMERIC="${VERSION%%-*}"
+          IFS='.' read -r a b c d <<< "${NUMERIC}"
+          echo "MSI_VERSION=${a:-0}.${b:-0}.${c:-0}.${d:-0}" >> "$GITHUB_ENV"
+
+      - name: Publish self-contained win-x64
+        run: |
+          dotnet publish WindowAudioRecorder.csproj -c Release -r win-x64 --self-contained true \
+            -p:Version=${VERSION%%-*} -o publish/win-x64
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $staging = "portable/WindowsAudioRecorder"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item -Path "publish/win-x64/*" -Destination $staging -Recurse
+          Compress-Archive -Path $staging -DestinationPath "dist/WindowsAudioRecorder-$env:VERSION-win-x64-portable.zip"
+
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          wix eula accept wix7
+          wix extension add WixToolset.UI.wixext WixToolset.Util.wixext
+
+      - name: Build MSI
+        run: |
+          mkdir -p dist
+          wix build Packaging/windows/Product.wxs \
+            -ext WixToolset.UI.wixext \
+            -ext WixToolset.Util.wixext \
+            -sw1077 \
+            -arch x64 \
+            -d "ProductVersion=${MSI_VERSION}" \
+            -d "PublishDir=${{ github.workspace }}\publish\win-x64" \
+            -d "RepoRoot=${{ github.workspace }}" \
+            -out "dist/WindowsAudioRecorder-${VERSION}-win-x64.msi"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          if-no-files-found: error
+          path: |
+            dist/*.msi
+            dist/*.zip
+
+  release:
+    needs: [verify-tag-on-main, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # only this job creates the release / uploads assets
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

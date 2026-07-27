@@ -1,0 +1,46 @@
+name: CI
+
+# Builds on every push and pull request. There is no test suite to run: this app is a UI
+# shell over WASAPI loopback, and everything worth asserting needs a real audio endpoint
+# that hosted runners don't have. The build is warning-clean, so CI treats warnings as
+# errors to keep it that way.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true # a superseded push/PR shouldn't burn runner time on a stale commit
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: WindowAudioRecorder.csproj
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore -warnaserror
+
+      - name: Publish (smoke test)
+        # Runs the same self-contained publish release.yml does, so a packaging break shows
+        # up on the PR that caused it rather than on the tag push that tried to ship it.
+        run: dotnet publish WindowAudioRecorder.csproj -c Release -r win-x64 --self-contained true -o publish/win-x64
